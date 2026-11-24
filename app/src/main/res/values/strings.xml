@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">AutoSend Zalo</string>
+    <string name="accessibility_service_label">AutoSend Zalo (Tự động gửi tin)</string>
+    <string name="accessibility_service_description">Cho phép AutoSend Zalo tự động tìm đúng tên nhóm chat đã chỉ định, kiểm tra khớp 100% tên nhóm và gửi tin nhắn kèm hình ảnh đúng giờ hẹn. Không thu thập hay gửi dữ liệu ra ngoài.</string>
+</resources>
