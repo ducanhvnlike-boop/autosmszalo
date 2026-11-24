@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
 
     <!-- Bắt buộc từ Android 11+ để kiểm tra và mở ứng dụng chat -->
     <queries>
@@ -36,6 +38,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Activity trung gian đánh thức màn hình, tự bỏ màn hình vuốt và khởi chạy Zalo từ nền -->
+        <activity
+            android:name=".automation.AutomationTrampolineActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:showWhenLocked="true"
+            android:theme="@style/Theme.AutoSendZalo"
+            android:turnScreenOn="true" />
 
         <!-- Dịch vụ hỗ trợ thao tác tự động vào Zalo & các app chat mở rộng -->
         <service

@@ -1,6 +1,6 @@
 package com.autosend.scheduler.automation
 
-import android.app.KeyguardManager
+import android.app.Activity
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -8,8 +8,8 @@ import android.os.PowerManager
 import com.autosend.scheduler.data.AppDatabase
 import com.autosend.scheduler.data.ExecutionLogEntity
 import com.autosend.scheduler.data.ExecutionStatus
-import com.autosend.scheduler.data.ScheduledTaskEntity
 import com.autosend.scheduler.data.ScheduleType
+import com.autosend.scheduler.data.ScheduledTaskEntity
 import com.autosend.scheduler.scheduler.ScheduleManager
 import com.autosend.scheduler.util.DeviceSetupHelper
 import com.autosend.scheduler.util.NotificationHelper
@@ -21,11 +21,15 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Điều phối phiên tự động hóa: quản lý hàng đợi chờ mở khóa, timeout an toàn 45 giây,
- * ghi lịch sử vào Room DB và tự động lên lịch lại cho các tác vụ lặp hằng ngày.
+ * Điều phối phiên tự động hóa:
+ * - Lưu hàng đợi chờ mở khóa vào SharedPreferences (không bị mất khi Android dọn RAM).
+ * - Đánh thức màn hình và khởi chạy qua AutomationTrampolineActivity + Full-Screen Intent
+ *   để hoạt động hoàn toàn tự động khi tắt màn hình (chế độ không khóa PIN) hoặc tự chạy ngay khi mở khóa.
  */
 object AutomationOrchestrator {
     private const val SESSION_TIMEOUT_MS = 45_000L
+    private const val PREFS_NAME = "autosend_runtime_prefs"
+    private const val KEY_PENDING_UNLOCK_TASK_ID = "pending_unlock_task_id"
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -33,25 +37,111 @@ object AutomationOrchestrator {
     private val _activeSession = MutableStateFlow<AutomationSession?>(null)
     val activeSession: StateFlow<AutomationSession?> = _activeSession
 
-    @Volatile
-    private var pendingUnlockTaskId: Long? = null
-
     private var timeoutRunnable: Runnable? = null
 
+    private fun savePendingUnlockTaskId(context: Context, taskId: Long?) {
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (taskId == null) {
+            prefs.edit().remove(KEY_PENDING_UNLOCK_TASK_ID).apply()
+        } else {
+            prefs.edit().putLong(KEY_PENDING_UNLOCK_TASK_ID, taskId).apply()
+        }
+    }
+
+    private fun consumePendingUnlockTaskId(context: Context): Long? {
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val id = prefs.getLong(KEY_PENDING_UNLOCK_TASK_ID, -1L)
+        if (id > 0L) {
+            prefs.edit().remove(KEY_PENDING_UNLOCK_TASK_ID).apply()
+            return id
+        }
+        return null
+    }
+
+    /**
+     * Được gọi từ AlarmReceiver hoặc nút Chạy thử.
+     * Mở AutomationTrampolineActivity (kèm Full-Screen Intent dự phòng) để bật màn hình & vượt chặn nền.
+     */
     fun triggerTaskById(context: Context, taskId: Long, forceDryRun: Boolean = false) {
         val appContext = context.applicationContext
+        wakeScreenBriefly(appContext)
+        savePendingUnlockTaskId(appContext, taskId)
+
+        val trampolineIntent = AutomationTrampolineActivity.createIntent(
+            context = appContext,
+            taskId = taskId,
+            forceDryRun = forceDryRun
+        )
+
+        // Thử mở trực tiếp Trampoline Activity (hoạt động mượt khi có quyền Overlay/AlarmClock)
+        val startedDirectly = runCatching {
+            appContext.startActivity(trampolineIntent)
+            true
+        }.getOrDefault(false)
+
+        // Luôn gửi thêm Full-Screen Intent notification nếu không thể mở trực tiếp từ nền
+        if (!startedDirectly) {
+            scope.launch {
+                val task = AppDatabase.getInstance(appContext).taskDao().getTaskById(taskId)
+                val groupName = task?.targetGroupName ?: "Nhóm Zalo"
+                NotificationHelper.notifyFullScreenWakeup(
+                    context = appContext,
+                    notificationId = taskId.toInt() + 2000,
+                    title = "Đến giờ gửi Zalo — $groupName",
+                    body = "Đang chuẩn bị tự động gửi tin nhắn kèm hình ảnh...",
+                    fullScreenIntent = trampolineIntent
+                )
+            }
+        }
+    }
+
+    fun markWaitingUnlock(context: Context, taskId: Long) {
+        val appContext = context.applicationContext
+        savePendingUnlockTaskId(appContext, taskId)
+        scope.launch {
+            val task = AppDatabase.getInstance(appContext).taskDao().getTaskById(taskId) ?: return@launch
+            recordOutcome(
+                context = appContext,
+                task = task,
+                status = ExecutionStatus.WAITING_UNLOCK,
+                detail = "Đã đến giờ gửi tới nhóm '${task.targetGroupName}' nhưng máy đang có khóa mật khẩu/vân tay. Mở khóa để tự động chạy ngay.",
+                rescheduleNow = false
+            )
+            val trampolineIntent = AutomationTrampolineActivity.createIntent(appContext, taskId, false)
+            NotificationHelper.notifyFullScreenWakeup(
+                context = appContext,
+                notificationId = taskId.toInt() + 2000,
+                title = "Đến giờ gửi Zalo — Mở khóa để gửi",
+                body = "Nhóm: ${task.targetGroupName}. Vừa mở khóa máy sẽ tự động gửi kèm ảnh.",
+                fullScreenIntent = trampolineIntent
+            )
+        }
+    }
+
+    /**
+     * Được gọi từ AutoSendAccessibilityService ngay khoảnh khắc người dùng mở khóa điện thoại (ACTION_USER_PRESENT).
+     */
+    fun onDeviceUnlocked(context: Context) {
+        val appContext = context.applicationContext
+        val pendingId = consumePendingUnlockTaskId(appContext) ?: return
+        val trampolineIntent = AutomationTrampolineActivity.createIntent(appContext, pendingId, false)
+        mainHandler.postDelayed({
+            runCatching { appContext.startActivity(trampolineIntent) }
+        }, 350L)
+    }
+
+    /**
+     * Thực thi gửi Zalo từ foreground (AutomationTrampolineActivity) -> không bị Android chặn nền và giữ nguyên 100% ảnh đính kèm.
+     */
+    fun executeFromForeground(activity: Activity, taskId: Long, forceDryRun: Boolean = false) {
+        val appContext = activity.applicationContext
+        savePendingUnlockTaskId(appContext, null)
         scope.launch {
             val dao = AppDatabase.getInstance(appContext).taskDao()
             val task = dao.getTaskById(taskId) ?: return@launch
             val effectiveTask = if (forceDryRun) task.copy(dryRun = true) else task
             startTaskInternal(appContext, effectiveTask)
         }
-    }
-
-    fun onDeviceUnlocked(context: Context) {
-        val taskId = pendingUnlockTaskId ?: return
-        pendingUnlockTaskId = null
-        triggerTaskById(context.applicationContext, taskId)
     }
 
     private suspend fun startTaskInternal(context: Context, task: ScheduledTaskEntity) {
@@ -94,28 +184,6 @@ object AutomationOrchestrator {
             return
         }
 
-        wakeScreenBriefly(context)
-
-        val keyguard = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-        if (keyguard.isKeyguardLocked) {
-            pendingUnlockTaskId = task.id
-            recordOutcome(
-                context,
-                task,
-                ExecutionStatus.WAITING_UNLOCK,
-                "Đã đến giờ gửi tới nhóm '${task.targetGroupName}' nhưng điện thoại đang khóa màn hình. Mở khóa để tự động chạy ngay.",
-                rescheduleNow = false
-            )
-            NotificationHelper.notify(
-                context,
-                task.id.toInt() + 2000,
-                "Đến giờ gửi Zalo — Mở khóa để gửi",
-                "Nhóm: ${task.targetGroupName}. Ngay khi bạn mở khóa, ứng dụng sẽ tự động gửi.",
-                isHighPriority = true
-            )
-            return
-        }
-
         val startIntent = adapter.buildStartIntent(context, task)
         if (startIntent == null) {
             recordOutcome(
@@ -143,7 +211,7 @@ object AutomationOrchestrator {
                 finishSession(
                     context,
                     ExecutionStatus.FAILED,
-                    "Không mở được ${platform.displayName} từ nền (kiểm tra quyền hiển thị pop-up nền trên Xiaomi): ${err.message}"
+                    "Không mở được ${platform.displayName}: ${err.message}"
                 )
             }
         }
@@ -209,13 +277,15 @@ object AutomationOrchestrator {
         }
 
         val isAlert = status == ExecutionStatus.ABORTED_SAFETY || status == ExecutionStatus.FAILED
-        NotificationHelper.notify(
-            context,
-            task.id.toInt() + 3000,
-            "${status.label} — ${task.targetGroupName}",
-            detail,
-            isHighPriority = isAlert
-        )
+        if (status != ExecutionStatus.WAITING_UNLOCK) {
+            NotificationHelper.notify(
+                context,
+                task.id.toInt() + 3000,
+                "${status.label} — ${task.targetGroupName}",
+                detail,
+                isHighPriority = isAlert
+            )
+        }
     }
 
     private fun scheduleTimeoutWatchdog(context: Context, session: AutomationSession) {
@@ -248,7 +318,7 @@ object AutomationOrchestrator {
                     PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
                     "AutoSendZalo:WakeLock"
                 )
-                wakeLock.acquire(8_000L)
+                wakeLock.acquire(10_000L)
             }
         }
     }

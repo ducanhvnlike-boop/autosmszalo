@@ -26,7 +26,7 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
             val uris = MediaStorageHelper.getShareableUris(context, imagePaths)
             if (uris.isEmpty()) return null
 
-            // Cấp quyền đọc FileProvider cho Zalo
+            // Cấp quyền đọc FileProvider rõ ràng cho Zalo
             uris.forEach { uri ->
                 context.grantUriPermission(
                     platform.packageName,
@@ -35,26 +35,25 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
                 )
             }
 
+            // QUAN TRỌNG: KHÔNG đính kèm EXTRA_TEXT trong Intent image/* gửi sang Zalo.
+            // Nhiều bản Zalo khi mở lạnh từ nền sẽ bị rớt hình ảnh (chỉ lấy chữ) nếu có cả EXTRA_TEXT lẫn EXTRA_STREAM.
+            // Nội dung tin nhắn sẽ được điền trực tiếp vào ô mô tả của Zalo sau khi chọn đúng nhóm.
             val intent = if (uris.size == 1) {
                 Intent(Intent.ACTION_SEND).apply {
                     type = "image/*"
                     putExtra(Intent.EXTRA_STREAM, uris.first())
-                    clipData = ClipData.newRawUri("image", uris.first())
+                    clipData = ClipData.newUri(context.contentResolver, "image", uris.first())
                 }
             } else {
                 Intent(Intent.ACTION_SEND_MULTIPLE).apply {
                     type = "image/*"
                     putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-                    val clip = ClipData.newRawUri("image_0", uris.first())
+                    val clip = ClipData.newUri(context.contentResolver, "image_0", uris.first())
                     for (i in 1 until uris.size) {
                         clip.addItem(ClipData.Item(uris[i]))
                     }
                     clipData = clip
                 }
-            }
-
-            if (task.messageText.isNotBlank()) {
-                intent.putExtra(Intent.EXTRA_TEXT, task.messageText)
             }
 
             return intent.apply {
@@ -86,10 +85,10 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
     }
 
     /**
-     * Luồng gửi Hình ảnh + Tin nhắn (mở qua Share Intent vào màn hình Chia sẻ của Zalo):
+     * Luồng gửi Hình ảnh + Tin nhắn (mở qua Share Intent vào màn hình Chia sẻ ảnh của Zalo):
      * Bước 1: Tìm ô Tìm kiếm trên màn hình Chia sẻ và nhập đúng tên nhóm.
      * Bước 2: Kiểm tra toàn bộ danh sách kết quả -> bắt buộc chỉ có ĐÚNG 1 kết quả khớp tên nhóm -> chọn.
-     * Bước 3: Điền nội dung tin nhắn vào ô mô tả (nếu có).
+     * Bước 3: Điền nội dung tin nhắn vào ô mô tả ảnh (nếu có).
      * Bước 4: Nếu Dry-Run thì dừng báo người dùng; ngược lại bấm nút Gửi/Chia sẻ.
      */
     private fun processShareImagesFlow(
@@ -110,7 +109,7 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
                         session.searchEntered = true
                         AutomationStepResult.Progress(
                             AutomationStage.SELECTING_GROUP,
-                            "Đã nhập tên nhóm '${session.task.targetGroupName}' vào ô tìm kiếm chia sẻ."
+                            "Đã nhập tên nhóm '${session.task.targetGroupName}' vào ô tìm kiếm chia sẻ ảnh."
                         )
                     } else {
                         AutomationStepResult.Progress(
@@ -119,7 +118,6 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
                         )
                     }
                 } else {
-                    // Một số phiên bản Zalo có nút kính lúp/Tìm kiếm cần bấm trước khi hiện ô nhập
                     val searchTrigger = findNodeByKeywords(
                         root,
                         listOf("tìm kiếm", "search", "tìm bạn", "tìm nhóm")
@@ -164,9 +162,8 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
                         }
                     }
                     else -> {
-                        // Đợi danh sách lọc kịp cập nhật trước khi kết luận không tìm thấy
                         session.retryCount++
-                        if (session.retryCount > 10) {
+                        if (session.retryCount > 12) {
                             AutomationStepResult.AbortSafety(
                                 "Không tìm thấy nhóm nào khớp chính xác tên '${session.task.targetGroupName}' trên Zalo."
                             )
@@ -182,6 +179,7 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
                 if (captionBox != null) {
                     val expected = session.task.messageText.trim()
                     if (captionBox.text?.toString()?.trim() != expected) {
+                        clickOrFocus(captionBox)
                         setNodeText(captionBox, expected)
                         session.messageEntered = true
                     }
@@ -190,12 +188,11 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
                         "Đã điền nội dung tin nhắn đính kèm ảnh."
                     )
                 } else {
-                    // Nếu Zalo không hiện ô nhập riêng ở bước này (hoặc đã tự nhận EXTRA_TEXT), chuyển sang bước kiểm tra gửi
                     session.retryCount++
-                    if (session.retryCount > 4) {
+                    if (session.retryCount > 6) {
                         AutomationStepResult.Progress(
                             AutomationStage.READY_TO_SEND,
-                            "Chuyển sang bước xác nhận gửi."
+                            "Chuyển sang bước xác nhận gửi ảnh."
                         )
                     } else {
                         AutomationStepResult.Waiting
@@ -237,7 +234,6 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
         return when (session.stage) {
             AutomationStage.LAUNCHING,
             AutomationStage.SEARCHING_GROUP -> {
-                // Nếu Zalo đang mở sẵn đúng nhóm chat rồi -> bỏ qua bước tìm kiếm
                 if (isChatHeaderExactMatch(root, session.task.targetGroupName)) {
                     return AutomationStepResult.Progress(
                         AutomationStage.ENTERING_MESSAGE,
@@ -293,7 +289,7 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
                     }
                     else -> {
                         session.retryCount++
-                        if (session.retryCount > 10) {
+                        if (session.retryCount > 12) {
                             AutomationStepResult.AbortSafety(
                                 "Không tìm thấy nhóm khớp chính xác '${session.task.targetGroupName}' trong Zalo."
                             )
@@ -323,7 +319,6 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
             }
 
             AutomationStage.ENTERING_MESSAGE -> {
-                // Xác minh lại tiêu đề lần nữa trước khi nhập tin
                 if (!isChatHeaderExactMatch(root, session.task.targetGroupName)) {
                     return AutomationStepResult.AbortSafety(
                         "Màn hình chat đã thay đổi, không còn khớp nhóm '${session.task.targetGroupName}'."
@@ -403,7 +398,6 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
     ): AccessibilityNodeInfo? {
         val normalizedExclude = normalize(excludeSearchText)
         val nodes = collectAllNodes(root)
-        // Ưu tiên EditText có gợi ý "tin nhắn" / "message" / "mô tả" / "caption"
         val exactHintMatch = nodes.firstOrNull { node ->
             val cls = node.className?.toString().orEmpty()
             if (!cls.contains("EditText", ignoreCase = true)) return@firstOrNull false
@@ -412,11 +406,11 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
             val id = node.viewIdResourceName.orEmpty().lowercase()
             hint.contains("tin nhắn") || hint.contains("message") ||
                 hint.contains("nhập") || hint.contains("mô tả") ||
-                desc.contains("tin nhắn") || id.contains("chat_input") || id.contains("message")
+                hint.contains("viết") || desc.contains("tin nhắn") ||
+                id.contains("chat_input") || id.contains("message") || id.contains("caption")
         }
         if (exactHintMatch != null) return exactHintMatch
 
-        // Dự phòng: EditText không phải ô search
         return nodes.firstOrNull { node ->
             val cls = node.className?.toString().orEmpty()
             val id = node.viewIdResourceName.orEmpty().lowercase()
@@ -427,9 +421,6 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
         }
     }
 
-    /**
-     * Tìm các dòng kết quả khớp tên nhóm (bỏ qua chính ô EditText đang gõ tìm kiếm).
-     */
     private fun findExactRecipientMatches(
         root: AccessibilityNodeInfo,
         targetName: String,
@@ -464,9 +455,6 @@ class ZaloAutomationAdapter : ChatAutomationAdapter {
         return matchedContainers.toList()
     }
 
-    /**
-     * Xác minh tiêu đề nhóm ở phần trên màn hình (top 22% màn hình) khớp chính xác tên nhóm.
-     */
     private fun isChatHeaderExactMatch(root: AccessibilityNodeInfo, targetName: String): Boolean {
         val target = normalize(targetName)
         val rootRect = android.graphics.Rect()

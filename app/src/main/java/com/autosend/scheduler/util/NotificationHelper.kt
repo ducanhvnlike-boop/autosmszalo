@@ -22,10 +22,10 @@ object NotificationHelper {
 
         val alertChannel = NotificationChannel(
             CHANNEL_ALERTS,
-            "Cảnh báo & Nhắc mở khóa",
+            "Cảnh báo & Đánh thức hẹn giờ",
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "Thông báo khi đến giờ gửi tin nhưng máy đang khóa hoặc phát hiện rủi ro gửi nhầm"
+            description = "Đánh thức màn hình khi đến giờ gửi tin và cảnh báo chống gửi nhầm"
         }
 
         val statusChannel = NotificationChannel(
@@ -38,6 +38,47 @@ object NotificationHelper {
 
         manager.createNotificationChannel(alertChannel)
         manager.createNotificationChannel(statusChannel)
+    }
+
+    fun notifyFullScreenWakeup(
+        context: Context,
+        notificationId: Int,
+        title: String,
+        body: String,
+        fullScreenIntent: Intent
+    ) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) return
+        }
+
+        ensureChannels(context)
+
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            notificationId,
+            fullScreenIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_ALERTS)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setFullScreenIntent(pendingIntent, true)
+            .build()
+
+        runCatching {
+            NotificationManagerCompat.from(context).notify(notificationId, notification)
+        }
     }
 
     fun notify(
